@@ -69,6 +69,7 @@ def make_reply(rep, bound=None):
 class ThreadingTCPServer(ThreadingMixIn, TCPServer):
     allow_reuse_address = True
     daemon_threads = True  # don't let live tunnels block process exit
+    request_queue_size = 1024  # default is 5: bursts of connections get SYN-dropped
 
 
 class SocksProxy(StreamRequestHandler):
