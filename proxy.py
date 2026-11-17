@@ -1,214 +1,222 @@
+"""SOCKS5 proxy (RFC 1928) with username/password auth (RFC 1929).
+
+Thread-per-connection, with an epoll/kqueue-based relay (selectors) so that
+high file-descriptor numbers do not break the data path. Only CONNECT is
+supported. Configuration comes from environment variables (see below).
+"""
+import hmac
 import logging
-import select
+import os
+import selectors
 import signal
 import socket
 import struct
 import sys
+import threading
 import time
 from socketserver import StreamRequestHandler, ThreadingMixIn, TCPServer
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG, 
-    filename='/var/www/html/proxy3.log', 
-    filemode='w', 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
 SOCKS_VERSION = 5
-PORT = 9000
 
-# FEATURE 2: Define your whitelisted IPs here. 
-# Leave the set empty (ALLOWED_IPS = set()) to allow all incoming connections.
-ALLOWED_IPS = {'127.0.0.1'} 
+# --- configuration (environment variables, with safe-for-local-testing defaults)
+HOST = os.environ.get("SOCKS_HOST", "0.0.0.0")
+PORT = int(os.environ.get("SOCKS_PORT", "9000"))
+USERNAME = os.environ.get("SOCKS_USER", "user")
+PASSWORD = os.environ.get("SOCKS_PASS", "pass")
+# Comma-separated; empty string means "allow everyone".
+ALLOWED_IPS = {ip for ip in os.environ.get("SOCKS_ALLOWED_IPS", "127.0.0.1").split(",") if ip}
+LOG_FILE = os.environ.get("SOCKS_LOG")  # default: log to stderr
+
+HANDSHAKE_TIMEOUT = 30    # seconds to finish the SOCKS handshake
+CONNECT_TIMEOUT = 10      # seconds to reach the target
+IDLE_TIMEOUT = 300        # seconds of silence before a tunnel is torn down
+BUFSIZE = 65536
+
+# RFC 1928 reply codes
+REP_SUCCESS = 0x00
+REP_GENERAL_FAILURE = 0x01
+REP_HOST_UNREACHABLE = 0x04
+REP_CONNECTION_REFUSED = 0x05
+REP_COMMAND_NOT_SUPPORTED = 0x07
+REP_ADDRESS_TYPE_NOT_SUPPORTED = 0x08
+
+log = logging.getLogger("socks5")
+
+
+def recv_exact(sock, n):
+    """Read exactly n bytes (TCP may deliver fewer per recv call)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("peer closed during handshake")
+        buf += chunk
+    return bytes(buf)
+
+
+def make_reply(rep, bound=None):
+    """Build a SOCKS5 reply. `bound` is the (host, port, family) of our outgoing socket."""
+    if bound is None:
+        return struct.pack("!BBBB4sH", SOCKS_VERSION, rep, 0, 1, b"\x00" * 4, 0)
+    host, port, family = bound
+    if family == socket.AF_INET6:
+        return struct.pack("!BBBB16sH", SOCKS_VERSION, rep, 0, 4,
+                           socket.inet_pton(socket.AF_INET6, host), port)
+    return struct.pack("!BBBB4sH", SOCKS_VERSION, rep, 0, 1,
+                       socket.inet_pton(socket.AF_INET, host), port)
+
 
 class ThreadingTCPServer(ThreadingMixIn, TCPServer):
-    # Allow the port to be immediately reused when the server restarts
     allow_reuse_address = True
+    daemon_threads = True  # don't let live tunnels block process exit
+
 
 class SocksProxy(StreamRequestHandler):
-    username = 'user'
-    password = 'pass'
-
     def handle(self):
         client_ip = self.client_address[0]
-        logging.info('Incoming connection request from %s:%s' % self.client_address)
-        
-        # FEATURE 2: IP Whitelist Enforcement
-        if ALLOWED_IPS and (client_ip not in ALLOWED_IPS):
-            logging.warning(f"Unauthorized connection dropped: {client_ip} is not in the whitelist.")
-            return  # Dropping connection instantly before allocating more resources
+        if ALLOWED_IPS and client_ip not in ALLOWED_IPS:
+            log.warning("dropped %s: not in whitelist", client_ip)
+            return
 
+        conn = self.connection
+        conn.settimeout(HANDSHAKE_TIMEOUT)
+        remote = None
         try:
-            # greeting header
-            # read and unpack 2 bytes from a client
-            header = self.connection.recv(2)
-            if not header or len(header) < 2:
+            ver, nmethods = struct.unpack("!BB", recv_exact(conn, 2))
+            if ver != SOCKS_VERSION:
                 return
-                
-            version, nmethods = struct.unpack("!BB", header)
-            # socks 5
-            assert version == SOCKS_VERSION
-            assert nmethods > 0
-
-            # get available methods
-            methods = self.get_available_methods(nmethods)
-
-            # accept only USERNAME/PASSWORD auth
-            if 2 not in set(methods):
-                # close connection
-                self.server.close_request(self.request)
+            methods = recv_exact(conn, nmethods)
+            if 2 not in methods:                       # only user/pass accepted
+                conn.sendall(struct.pack("!BB", SOCKS_VERSION, 0xFF))
                 return
-
-            # send welcome message
-            self.connection.sendall(struct.pack("!BB", SOCKS_VERSION, 2))
-
+            conn.sendall(struct.pack("!BB", SOCKS_VERSION, 2))
             if not self.verify_credentials():
                 return
 
-            # request
-            request_header = self.connection.recv(4)
-            if not request_header or len(request_header) < 4:
+            ver, cmd, _, atyp = struct.unpack("!BBBB", recv_exact(conn, 4))
+            if ver != SOCKS_VERSION:
                 return
-                
-            version, cmd, _, address_type = struct.unpack("!BBBB", request_header)
-            assert version == SOCKS_VERSION
+            if atyp == 1:
+                host = socket.inet_ntoa(recv_exact(conn, 4))
+            elif atyp == 3:
+                length = recv_exact(conn, 1)[0]
+                host = recv_exact(conn, length).decode("ascii", errors="strict")
+            elif atyp == 4:
+                host = socket.inet_ntop(socket.AF_INET6, recv_exact(conn, 16))
+            else:
+                conn.sendall(make_reply(REP_ADDRESS_TYPE_NOT_SUPPORTED))
+                return
+            port = struct.unpack("!H", recv_exact(conn, 2))[0]
 
-            if address_type == 1:  # IPv4
-                address = socket.inet_ntoa(self.connection.recv(4))
-            elif address_type == 3:  # Domain name
-                domain_length = self.connection.recv(1)[0]
-                address = self.connection.recv(domain_length)
-                address = socket.gethostbyname(address)
-            port = struct.unpack('!H', self.connection.recv(2))[0]
+            if cmd != 1:                               # BIND / UDP ASSOCIATE
+                conn.sendall(make_reply(REP_COMMAND_NOT_SUPPORTED))
+                return
 
-            # reply
             try:
-                if cmd == 1:  # CONNECT
-                    remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    remote.connect((address, port))
-                    remote.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-                    bind_address = remote.getsockname()
-                    logging.info('Connected to remote target: %s:%s' % (address, port))
-                else:
-                    self.server.close_request(self.request)
-                    return
+                remote = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+            except ConnectionRefusedError:
+                conn.sendall(make_reply(REP_CONNECTION_REFUSED))
+                return
+            except (socket.gaierror, socket.timeout, TimeoutError):
+                conn.sendall(make_reply(REP_HOST_UNREACHABLE))
+                return
+            except OSError as err:
+                log.error("connect to %s:%s failed: %s", host, port, err)
+                conn.sendall(make_reply(REP_GENERAL_FAILURE))
+                return
 
-                addr = struct.unpack("!I", socket.inet_aton(bind_address[0]))[0]
-                port_num = bind_address[1]
-                reply = struct.pack("!BBBBIH", SOCKS_VERSION, 0, 0, 1, addr, port_num)
-            except Exception as err:
-                logging.error(f"Failed to connect to target: {err}")
-                # return connection refused error
-                reply = self.generate_failed_reply(address_type, 5)
+            bhost, bport = remote.getsockname()[:2]
+            conn.sendall(make_reply(REP_SUCCESS, (bhost, bport, remote.family)))
+            log.info("tunnel %s -> %s:%s", client_ip, host, port)
 
-            self.connection.sendall(reply)
-
-            # establish data exchange
-            if reply[1] == 0 and cmd == 1:
-                self.exchange_loop(self.connection, remote)
-
-        except (AssertionError, struct.error) as e:
-            logging.error(f"Protocol violation or bad packet formatting: {e}")
+            conn.settimeout(None)
+            remote.settimeout(None)
+            self.relay(conn, remote)
+        except (ConnectionError, struct.error, UnicodeDecodeError, socket.timeout) as err:
+            log.warning("handshake aborted for %s: %s", client_ip, err)
         finally:
-            self.server.close_request(self.request)
-
-    def get_available_methods(self, n):
-        methods = []
-        for i in range(n):
-            byte = self.connection.recv(1)
-            if byte:
-                methods.append(ord(byte))
-        return methods
+            if remote is not None:
+                remote.close()
 
     def verify_credentials(self):
-        version_byte = self.connection.recv(1)
-        if not version_byte:
+        conn = self.connection
+        ver = recv_exact(conn, 1)[0]
+        if ver != 1:
             return False
-        version = ord(version_byte)
-        assert version == 1
+        user = recv_exact(conn, recv_exact(conn, 1)[0])
+        pw = recv_exact(conn, recv_exact(conn, 1)[0])
+        ok = hmac.compare_digest(user, USERNAME.encode()) & hmac.compare_digest(pw, PASSWORD.encode())
+        conn.sendall(struct.pack("!BB", 1, 0 if ok else 1))
+        if not ok:
+            log.warning("auth failed from %s", self.client_address[0])
+        return ok
 
-        username_len_byte = self.connection.recv(1)
-        if not username_len_byte:
-            return False
-        username_len = ord(username_len_byte)
-        username = self.connection.recv(username_len).decode('utf-8')
-
-        password_len_byte = self.connection.recv(1)
-        if not password_len_byte:
-            return False
-        password_len = ord(password_len_byte)
-        password = self.connection.recv(password_len).decode('utf-8')
-
-        if username == self.username and password == self.password:
-            # success, status = 0
-            response = struct.pack("!BB", version, 0)
-            self.connection.sendall(response)
-            return True
-
-        # failure, status != 0
-        response = struct.pack("!BB", version, 0xFF)
-        self.connection.sendall(response)
-        self.server.close_request(self.request)
-        return False
-
-    def generate_failed_reply(self, address_type, error_number):
-        return struct.pack("!BBBBIH", SOCKS_VERSION, error_number, 0, address_type, 0, 0)
-
-    # FEATURE 4: Tracking metrics and dynamic performance tracking
-    def exchange_loop(self, client, remote):
-        start_time = time.time()
-        bytes_sent_to_remote = 0
-        bytes_received_from_remote = 0
-
-        while True:
-            # Wait until client or remote is available for reading
-            r, w, e = select.select([client, remote], [], [])
-            
-            if client in r:
-                data = client.recv(8192)
-                if not data:  # Catch cleanly closed connection
+    def relay(self, client, remote):
+        """Shuttle bytes both ways. An EOF on one side half-closes the other, so
+        a client that sends a request and shuts down its write side still gets
+        the full response."""
+        started = time.time()
+        up = down = 0
+        sel = selectors.DefaultSelector()
+        sel.register(client, selectors.EVENT_READ, remote)
+        sel.register(remote, selectors.EVENT_READ, client)
+        try:
+            while sel.get_map():
+                events = sel.select(timeout=IDLE_TIMEOUT)
+                if not events:
+                    log.info("idle timeout for %s", self.client_address[0])
                     break
-                bytes_sent_to_remote += len(data)
-                if remote.send(data) <= 0:
-                    break
+                for key, _ in events:
+                    src, dst = key.fileobj, key.data
+                    data = src.recv(BUFSIZE)
+                    if not data:                       # EOF: propagate as half-close
+                        sel.unregister(src)
+                        try:
+                            dst.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        continue
+                    dst.sendall(data)
+                    if src is client:
+                        up += len(data)
+                    else:
+                        down += len(data)
+        except OSError as err:                         # reset by peer, broken pipe, ...
+            log.info("relay ended: %s", err)
+        finally:
+            sel.close()
+            log.info("closed %s duration=%.2fs up=%d down=%d",
+                     self.client_address[0], time.time() - started, up, down)
 
-            if remote in r:
-                data = remote.recv(8192)
-                if not data:  # Catch cleanly closed connection
-                    break
-                bytes_received_from_remote += len(data)
-                if client.send(data) <= 0:
-                    break
 
-        duration = time.time() - start_time
-        
-        # Log aggregated performance telemetry
-        logging.info(
-            f"[METRICS] Session Closed for client {self.client_address[0]}. "
-            f"Active Duration: {duration:.2f}s | "
-            f"Bytes Uploaded: {bytes_sent_to_remote} | "
-            f"Bytes Downloaded: {bytes_received_from_remote}"
-        )
+def make_server(host=HOST, port=PORT):
+    return ThreadingTCPServer((host, port), SocksProxy)
 
 
-if __name__ == '__main__':
-    server = ThreadingTCPServer(('0.0.0.0', PORT), SocksProxy)
+def main():
+    logging.basicConfig(level=logging.INFO, filename=LOG_FILE,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    server = make_server()
+    stop = threading.Event()
 
-    # FEATURE 3: Graceful Shutdown & POSIX Signal Handling
-    def graceful_shutdown(signum, frame):
-        logging.info(f"System received shutdown signal ({signum}). Terminating threads cleanly...")
-        print(f"\n[!] Signal {signum} caught. Closing active server sockets gracefully...")
-        server.shutdown()       # Stops the serve_forever loop running on the main thread
-        server.server_close()   # Cleanly closes the listening socket binding
-        logging.info("Server completely stopped. Goodbye.")
-        sys.exit(0)
+    def on_signal(signum, _frame):
+        stop.set()                                     # never call shutdown() here
 
-    # Register handlers for Ctrl+C (SIGINT) and termination demands (SIGTERM)
-    signal.signal(signal.SIGINT, graceful_shutdown)
-    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
 
-    print("SOCKS5 Proxy Server listening on port {}".format(PORT))
-    logging.info(f"SOCKS5 Engine Initialized on port {PORT}. Active loop starting.")
-    
-    server.serve_forever()
+    # serve_forever() runs on its own thread so shutdown() can be called from
+    # this one. (Calling shutdown() from the thread running serve_forever()
+    # deadlocks.)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    log.info("listening on %s:%s", *server.server_address[:2])
+    print("SOCKS5 proxy listening on %s:%s" % server.server_address[:2], flush=True)
+    stop.wait()
+    server.shutdown()
+    server.server_close()
+    log.info("stopped")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

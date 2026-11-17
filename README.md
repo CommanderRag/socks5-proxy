@@ -8,7 +8,7 @@ A multi-threaded SOCKS5 proxy server built from scratch in Python, following [RF
 - **Username/password authentication (Sub-negotiation, RFC 1929)** — rejects any client that doesn't offer method `0x02`, and verifies credentials before allowing a connection through.
 - **IP whitelisting** — connections from IPs outside `ALLOWED_IPS` are dropped immediately, before any bytes are read off the socket.
 - **`CONNECT` command support** — resolves the target (IPv4 or domain name) and opens a connection to it on the client's behalf. `BIND` and `UDP ASSOCIATE` are not implemented.
-- **Threaded connection handling** — built on `ThreadingMixIn`, so each client connection is handled on its own thread and multiple sessions can run concurrently.
+- **Threaded connection handling** — built on `ThreadingMixIn`, so each client connection is handled on its own thread (the relay itself uses `selectors`, i.e. epoll on Linux) and multiple sessions can run concurrently.
 - **Non-blocking relay loop** — once the tunnel is established, `select()` multiplexes reads between the client and the remote socket so data flows in both directions without busy-waiting.
 - **Per-session metrics** — logs session duration, bytes uploaded, and bytes downloaded once a connection closes.
 - **Graceful shutdown** — `SIGINT` / `SIGTERM` are caught to shut the server down cleanly instead of dropping connections abruptly.
@@ -19,31 +19,28 @@ A multi-threaded SOCKS5 proxy server built from scratch in Python, following [RF
 
 ## Usage
 
-1. **Set your whitelist** (optional). By default, only `127.0.0.1` is allowed:
-   ```python
-   ALLOWED_IPS = {'127.0.0.1'}
-   ```
-   Add more IPs as needed, or set `ALLOWED_IPS = set()` to allow all incoming connections.
+Configuration is via environment variables (defaults shown):
 
-2. **Set credentials.** The proxy currently uses a single hardcoded username/password pair in the `SocksProxy` class:
-   ```python
-   username = 'user'
-   password = 'pass'
-   ```
-   Change these before running anywhere outside a local test environment (see [Known Limitations](#known-limitations)).
+| Variable | Default | Meaning |
+|---|---|---|
+| `SOCKS_HOST` / `SOCKS_PORT` | `0.0.0.0` / `9000` | listen address |
+| `SOCKS_USER` / `SOCKS_PASS` | `user` / `pass` | the single credential pair - **change before real use** |
+| `SOCKS_ALLOWED_IPS` | `127.0.0.1` | comma-separated client whitelist; empty = allow all |
+| `SOCKS_LOG` | stderr | log file path |
 
-3. **Set the log path.** Logs are written to `/var/www/html/proxy3.log` by default — update the `filename` in the `logging.basicConfig()` call to a path that exists on your system.
+```bash
+SOCKS_USER=me SOCKS_PASS=secret python3 proxy.py
+curl --socks5-hostname me:secret@127.0.0.1:9000 https://example.com
+```
 
-4. **Run the server:**
-   ```bash
-   python3 proxie.py
-   ```
-   The server listens on `0.0.0.0:9000` by default.
+## Tests
 
-5. **Point a SOCKS5 client at it**, e.g. with `curl`:
-   ```bash
-   curl --socks5 user:pass@127.0.0.1:9000 https://example.com
-   ```
+```bash
+pip install pytest
+pytest -q
+```
+
+Covers the handshake (including byte-at-a-time delivery), auth failure, unsupported commands/address types, IPv4/IPv6/domain targets, half-close, a 2 MB integrity transfer, 150 simultaneous tunnels, the whitelist, and SIGINT/SIGTERM shutdown.
 
 ## Stopping the Server
 
@@ -51,7 +48,7 @@ A multi-threaded SOCKS5 proxy server built from scratch in Python, following [RF
 
 ## Known Limitations
 
-- **Credentials and log path are hardcoded** in source rather than pulled from a config file or environment variables — fine for local testing, but should be externalized before any real deployment.
+- **Credentials come from environment variables** — fine for local use; a real deployment wants a secret store.
 - **Single shared credential pair** — there's no per-user account system; every client authenticates with the same username/password.
 - **No TLS** — traffic between the client and this proxy is not encrypted at the proxy layer.
 - **Only `CONNECT` is implemented** — `BIND` and `UDP ASSOCIATE` requests are rejected.
